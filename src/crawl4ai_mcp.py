@@ -20,7 +20,7 @@ import json
 import os
 import re
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher, RateLimiter 
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 from utils import get_supabase_client, add_documents_to_supabase, search_documents
 
 # Load environment variables from the project root .env file
@@ -209,19 +209,8 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
-        # Configure the crawl with rate limiting
-        rate_limiter = RateLimiter(
-            base_delay=(2.0, 4.0),     # Random delay between 2-4 seconds between requests
-            max_delay=30.0,            # Maximum delay cap for exponential backoff
-            max_retries=3,             # Retry up to 3 times on rate-limiting errors
-            rate_limit_codes=[429, 503, 403, 500]  # HTTP status codes that trigger rate limiting
-        )
-        
-        run_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS, 
-            stream=False,
-            rate_limiter=rate_limiter
-        )
+        # Configure the crawl
+        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         
         # Crawl the page
         result = await crawler.arun(url=url, config=run_config)
@@ -279,14 +268,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(
-    ctx: Context, 
-    url: str, 
-    max_depth: int = 3, 
-    max_concurrent: int = 5,   # Reduced from 10 to 5 for slower crawling
-    chunk_size: int = 5000,
-    crawl_speed: str = "normal"  # Options: "slow", "normal", "fast"
-) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
     
@@ -301,9 +283,8 @@ async def smart_crawl_url(
         ctx: The MCP server provided context
         url: URL to crawl (can be a regular webpage, sitemap.xml, or .txt file)
         max_depth: Maximum recursion depth for regular URLs (default: 3)
-        max_concurrent: Maximum number of concurrent browser sessions (default: 5)
-        chunk_size: Maximum size of each content chunk in characters (default: 5000)
-        crawl_speed: Speed of crawling ("slow", "normal", "fast") - affects delay between requests
+        max_concurrent: Maximum number of concurrent browser sessions (default: 10)
+        chunk_size: Maximum size of each content chunk in characters (default: 1000)
     
     Returns:
         JSON string with crawl summary and storage information
@@ -313,32 +294,13 @@ async def smart_crawl_url(
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
-        # Define crawl speed settings
-        speed_settings = {
-            "slow": {"delay": (5.0, 8.0), "concurrent": max(1, int(max_concurrent/2))},
-            "normal": {"delay": (2.0, 4.0), "concurrent": max_concurrent},
-            "fast": {"delay": (0.5, 2.0), "concurrent": max_concurrent}
-        }
-        
-        # Get settings based on crawl_speed parameter (default to normal)
-        settings = speed_settings.get(crawl_speed.lower(), speed_settings["normal"])
-        
-        # Create rate limiter with configured delay
-        rate_limiter = RateLimiter(
-            base_delay=settings["delay"],
-            max_delay=30.0,
-            max_retries=3,
-            rate_limit_codes=[429, 503, 403, 500]
-        )
-        
         crawl_results = []
         crawl_type = "webpage"
-        actual_max_concurrent = settings["concurrent"]
         
         # Detect URL type and use appropriate crawl method
         if is_txt(url):
             # For text files, use simple crawl
-            crawl_results = await crawl_markdown_file(crawler, url, rate_limiter)
+            crawl_results = await crawl_markdown_file(crawler, url)
             crawl_type = "text_file"
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
@@ -349,11 +311,11 @@ async def smart_crawl_url(
                     "url": url,
                     "error": "No URLs found in sitemap"
                 }, indent=2)
-            crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=actual_max_concurrent, rate_limiter=rate_limiter)
+            crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
         else:
             # For regular URLs, use recursive crawl
-            crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=actual_max_concurrent, rate_limiter=rate_limiter)
+            crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
             crawl_type = "webpage"
         
         if not crawl_results:
@@ -396,15 +358,15 @@ async def smart_crawl_url(
         for doc in crawl_results:
             url_to_full_document[doc['url']] = doc['markdown']
         
-        # Add to Supabase with smaller batch size to prevent overwhelming the embedding API
-        batch_size = 10  # Reduced from 20 to 10 to avoid overwhelming the embedding API
+        # Add to Supabase
+        # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
+        batch_size = 20
         add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         return json.dumps({
             "success": True,
             "url": url,
             "crawl_type": crawl_type,
-            "crawl_speed": crawl_speed,
             "pages_crawled": len(crawl_results),
             "chunks_stored": chunk_count,
             "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
@@ -416,19 +378,18 @@ async def smart_crawl_url(
             "error": str(e)
         }, indent=2)
 
-async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str, rate_limiter: RateLimiter = None) -> List[Dict[str, Any]]:
+async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
     """
     Crawl a .txt or markdown file.
     
     Args:
         crawler: AsyncWebCrawler instance
         url: URL of the file
-        rate_limiter: Optional rate limiter configuration
         
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(rate_limiter=rate_limiter)
+    crawl_config = CrawlerRunConfig()
 
     result = await crawler.arun(url=url, config=crawl_config)
     if result.success and result.markdown:
@@ -437,12 +398,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str, rate_limiter: 
         print(f"Failed to crawl {url}: {result.error_message}")
         return []
 
-async def crawl_batch(
-    crawler: AsyncWebCrawler, 
-    urls: List[str], 
-    max_concurrent: int = 5, 
-    rate_limiter: RateLimiter = None
-) -> List[Dict[str, Any]]:
+async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
     Batch crawl multiple URLs in parallel.
     
@@ -450,34 +406,21 @@ async def crawl_batch(
         crawler: AsyncWebCrawler instance
         urls: List of URLs to crawl
         max_concurrent: Maximum number of concurrent browser sessions
-        rate_limiter: Optional rate limiter configuration
         
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        rate_limiter=rate_limiter
-    )
-    
+    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
-        max_session_permit=max_concurrent,
-        rate_limiter=rate_limiter
+        max_session_permit=max_concurrent
     )
 
     results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
     return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
 
-async def crawl_recursive_internal_links(
-    crawler: AsyncWebCrawler, 
-    start_urls: List[str], 
-    max_depth: int = 3, 
-    max_concurrent: int = 5,
-    rate_limiter: RateLimiter = None
-) -> List[Dict[str, Any]]:
+async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
     Recursively crawl internal links from start URLs up to a maximum depth.
     
@@ -486,22 +429,15 @@ async def crawl_recursive_internal_links(
         start_urls: List of starting URLs
         max_depth: Maximum recursion depth
         max_concurrent: Maximum number of concurrent browser sessions
-        rate_limiter: Optional rate limiter configuration
         
     Returns:
         List of dictionaries with URL and markdown content
     """
-    run_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS, 
-        stream=False,
-        rate_limiter=rate_limiter
-    )
-    
+    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
         check_interval=1.0,
-        max_session_permit=max_concurrent,
-        rate_limiter=rate_limiter
+        max_session_permit=max_concurrent
     )
 
     visited = set()
@@ -517,10 +453,6 @@ async def crawl_recursive_internal_links(
         if not urls_to_crawl:
             break
 
-        # Add a small delay between batches to avoid spiking the server
-        if depth > 0:
-            await asyncio.sleep(3.0)
-            
         results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
         next_level_urls = set()
 

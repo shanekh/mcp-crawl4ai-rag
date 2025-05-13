@@ -3,6 +3,7 @@ Utility functions for the Crawl4AI MCP server.
 """
 import os
 import concurrent.futures
+import time
 from typing import List, Dict, Any, Optional, Tuple
 import json
 from supabase import create_client, Client
@@ -41,6 +42,9 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
         return []
         
     try:
+        # Add a small delay before making the API call to avoid rate limiting
+        time.sleep(0.5)
+        
         response = openai.embeddings.create(
             model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
             input=texts
@@ -48,6 +52,21 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
         return [item.embedding for item in response.data]
     except Exception as e:
         print(f"Error creating batch embeddings: {e}")
+        # Implement exponential backoff for rate limiting errors
+        if "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
+            retry_after = 30  # Default retry delay
+            print(f"Rate limit hit, backing off for {retry_after} seconds")
+            time.sleep(retry_after)
+            try:
+                # Try again after backing off
+                response = openai.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=texts
+                )
+                return [item.embedding for item in response.data]
+            except Exception as retry_e:
+                print(f"Error on retry: {retry_e}")
+        
         # Return empty embeddings if there's an error
         return [[0.0] * 1536 for _ in range(len(texts))]
 
@@ -62,6 +81,9 @@ def create_embedding(text: str) -> List[float]:
         List of floats representing the embedding
     """
     try:
+        # Add a small delay before making the API call to avoid rate limiting
+        time.sleep(0.5)
+        
         embeddings = create_embeddings_batch([text])
         return embeddings[0] if embeddings else [0.0] * 1536
     except Exception as e:
@@ -95,6 +117,9 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
+        # Add a small delay before making the API call to avoid rate limiting
+        time.sleep(1.0)
+        
         # Call the OpenAI API to generate contextual information
         response = openai.chat.completions.create(
             model=model_choice,
@@ -116,6 +141,30 @@ Please give a short succinct context to situate this chunk within the overall do
     
     except Exception as e:
         print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
+        
+        # Handle rate limiting errors with backoff
+        if "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
+            retry_after = 60  # Longer delay for LLM rate limiting
+            print(f"Rate limit hit for LLM API, backing off for {retry_after} seconds")
+            time.sleep(retry_after)
+            try:
+                # Try again after backing off
+                response = openai.chat.completions.create(
+                    model=model_choice,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=200
+                )
+                context = response.choices[0].message.content.strip()
+                contextual_text = f"{context}\n---\n{chunk}"
+                return contextual_text, True
+            except Exception as retry_e:
+                print(f"Error on retry for contextual embedding: {retry_e}")
+        
+        # Return original chunk if all attempts fail
         return chunk, False
 
 def process_chunk_with_context(args):
@@ -141,7 +190,7 @@ def add_documents_to_supabase(
     contents: List[str], 
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
-    batch_size: int = 20
+    batch_size: int = 10
 ) -> None:
     """
     Add documents to the Supabase crawled_pages table in batches.
@@ -188,6 +237,10 @@ def add_documents_to_supabase(
         batch_contents = contents[i:batch_end]
         batch_metadatas = metadatas[i:batch_end]
         
+        # Add a delay between batches to prevent overwhelming the server
+        if i > 0:
+            time.sleep(2.0)
+        
         # Apply contextual embedding to each chunk if MODEL_CHOICE is set
         if use_contextual_embeddings:
             # Prepare arguments for parallel processing
@@ -197,9 +250,9 @@ def add_documents_to_supabase(
                 full_document = url_to_full_document.get(url, "")
                 process_args.append((url, content, full_document))
             
-            # Process in parallel using ThreadPoolExecutor
+            # Process in parallel using ThreadPoolExecutor with reduced max_workers
             contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:  # Reduced from 10 to 5
                 # Submit all tasks and collect results
                 future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
                                 for idx, arg in enumerate(process_args)}
@@ -253,6 +306,21 @@ def add_documents_to_supabase(
             client.table("crawled_pages").insert(batch_data).execute()
         except Exception as e:
             print(f"Error inserting batch into Supabase: {e}")
+            
+            # Implement retries with smaller batches if insertion fails
+            if len(batch_data) > 1:
+                print("Retrying with smaller batches...")
+                # Split the batch in half and retry
+                half = len(batch_data) // 2
+                try:
+                    client.table("crawled_pages").insert(batch_data[:half]).execute()
+                except Exception as e1:
+                    print(f"Error inserting first half of batch: {e1}")
+                
+                try:
+                    client.table("crawled_pages").insert(batch_data[half:]).execute()
+                except Exception as e2:
+                    print(f"Error inserting second half of batch: {e2}")
 
 def search_documents(
     client: Client, 
